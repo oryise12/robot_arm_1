@@ -1,0 +1,196 @@
+import rclpy
+from rclpy.node import Node
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+from collections import namedtuple
+from arm_pose_msgs.msg import ArmHandState
+
+class ArmPosePublisher(Node):
+    def __init__(self):
+        super().__init__('arm_pose_publisher')
+        self.Landmark = namedtuple('Landmark', ['x', 'y', 'z'])
+        self.state_publisher = self.create_publisher(ArmHandState, 'arm_hand_state', 10)
+
+        timer_period = 0.06
+        self.timer = self.create_timer(timer_period, self.timer_callback)
+
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            self.get_logger().error('웹캠을 열 수 없습니다.')
+            return
+
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7, max_num_hands=1)
+        self.mp_drawing = mp.solutions.drawing_utils
+        
+        # 팔꿈치 고정을 위한 타겟 UI 정보
+        self.screen_width, self.screen_height = None, None
+        self.elbow_target_center_px = (500, 400)
+        self.elbow_target_radius_px = 27
+
+        self.get_logger().info('Arm Pose Publisher 노드가 시작되었습니다.')
+
+    def get_average_landmark(self, lm1, lm2):
+        return self.Landmark(x=(lm1.x + lm2.x)/2, y=(lm1.y + lm2.y)/2, z=(lm1.z + lm2.z)/2)
+
+    def to_numpy(self, landmark):
+        return np.array([landmark.x, landmark.y, landmark.z])
+
+    def calculate_angle_between_vectors(self, v1, v2):
+        # 벡터 정규화 후 내적하여 각도 계산
+        norm_v1 = np.linalg.norm(v1)
+        norm_v2 = np.linalg.norm(v2)
+        if norm_v1 == 0 or norm_v2 == 0:
+            return 0.0
+        v1_u = v1 / norm_v1
+        v2_u = v2 / norm_v2
+        return np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0))
+    
+    def calculate_angle_3d(self, p1, p2, p3):
+        # 세 점 사이의 각도 계산 (p2가 중심점)
+        v1 = self.to_numpy(p1) - self.to_numpy(p2)
+        v2 = self.to_numpy(p3) - self.to_numpy(p2)
+        return self.calculate_angle_between_vectors(v1, v2)
+
+    def timer_callback(self):
+        success, image = self.cap.read()
+        if not success: return
+
+        if self.screen_width is None:
+            self.screen_height, self.screen_width, _ = image.shape
+
+        image.flags.writeable = False
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pose_results = self.pose.process(image_rgb)
+        hand_results = self.hands.process(image_rgb)
+        image.flags.writeable = True
+
+        is_elbow_in_target = False
+        if pose_results.pose_landmarks:
+            elbow_lm = pose_results.pose_landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_ELBOW]
+            elbow_px_x = int(elbow_lm.x * self.screen_width)
+            elbow_px_y = int(elbow_lm.y * self.screen_height)
+            
+            distance = math.sqrt((elbow_px_x - self.elbow_target_center_px[0])**2 + (elbow_px_y - self.elbow_target_center_px[1])**2)
+            if distance < self.elbow_target_radius_px:
+                is_elbow_in_target = True
+
+        if is_elbow_in_target and hand_results.multi_hand_landmarks:
+            hand_landmarks = hand_results.multi_hand_landmarks[0].landmark
+            state_msg = ArmHandState()
+            state_msg.header.stamp = self.get_clock().now().to_msg()
+
+            # --- 1. '가상 팔꿈치' 생성 ---
+            h_wrist_lm = hand_landmarks[self.mp_hands.HandLandmark.WRIST]
+            target_norm_x = self.elbow_target_center_px[0] / self.screen_width
+            target_norm_y = self.elbow_target_center_px[1] / self.screen_height
+            virtual_elbow = self.Landmark(x=target_norm_x, y=target_norm_y, z=h_wrist_lm.z)
+
+            # --- 2. 재정의된 팔/손목 각도 계산 ---
+            forearm_vec = self.to_numpy(h_wrist_lm) - self.to_numpy(virtual_elbow)
+            
+            # 팔꿈치 굽힘 (방향 추가)
+            ref_up_vec = np.array([0, -1, 0])
+            elbow_flexion_angle = self.calculate_angle_between_vectors(forearm_vec, ref_up_vec)
+            
+            # [수정됨] forearm_vec의 x좌표 부호를 이용해 좌/우 방향을 결정합니다.
+            # (수직 위쪽 기준, 시계방향이 +, 반시계방향이 -)
+            elbow_flexion_sign = np.sign(forearm_vec[0]) if np.sign(forearm_vec[0]) != 0 else 1.0
+            state_msg.elbow_flexion = elbow_flexion_angle * elbow_flexion_sign
+
+            # 손목 굽힘 (방향 추가)
+            h_index_mcp = hand_landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_MCP]
+            h_pinky_mcp = hand_landmarks[self.mp_hands.HandLandmark.PINKY_MCP]
+            h_middle_mcp_virtual = self.get_average_landmark(h_index_mcp, h_pinky_mcp)
+            
+            wrist_flexion_angle = self.calculate_angle_3d(virtual_elbow, h_wrist_lm, h_middle_mcp_virtual)
+
+            # [수정됨] 외적과 내적을 이용해 손목 굽힘/폄 방향을 결정합니다.
+            v_forearm = self.to_numpy(virtual_elbow) - self.to_numpy(h_wrist_lm)
+            v_hand = self.to_numpy(h_middle_mcp_virtual) - self.to_numpy(h_wrist_lm)
+            v_hand_axis = self.to_numpy(h_index_mcp) - self.to_numpy(h_pinky_mcp)
+
+            bend_axis = np.cross(v_forearm, v_hand)
+            direction_dot = np.dot(bend_axis, v_hand_axis)
+            wrist_flexion_sign = np.sign(direction_dot) if np.sign(direction_dot) != 0 else 1.0
+
+            # 사용자가 보기에 손목을 아래로 굽히는 것(flexion)을 양수(+)로 만들기 위해 부호를 반전시킵니다.
+            state_msg.wrist_flexion = wrist_flexion_angle * -wrist_flexion_sign
+            
+            # 손목 회전 (기존과 동일)
+            forearm_vec_normalized = forearm_vec / np.linalg.norm(forearm_vec)
+            hand_palm_vec = self.to_numpy(h_index_mcp) - self.to_numpy(h_pinky_mcp)
+            projected_hand_vec = hand_palm_vec - np.dot(hand_palm_vec, forearm_vec_normalized) * forearm_vec_normalized
+            projected_hand_vec /= np.linalg.norm(projected_hand_vec)
+            
+            projected_up_vec = ref_up_vec - np.dot(ref_up_vec, forearm_vec_normalized) * forearm_vec_normalized
+            projected_up_vec /= np.linalg.norm(projected_up_vec)
+            
+            rotation_angle = self.calculate_angle_between_vectors(projected_up_vec, projected_hand_vec)
+            cross_product = np.cross(projected_up_vec, projected_hand_vec)
+            if np.dot(cross_product, forearm_vec_normalized) < 0:
+                rotation_angle = -rotation_angle
+            state_msg.wrist_rotation = rotation_angle
+
+            # --- 3. 손가락 각도 계산 ---
+            # (이하 기존 코드와 동일)
+            fingers_flexion = []
+            finger_definitions = [
+                ("INDEX", [self.mp_hands.HandLandmark.INDEX_FINGER_MCP, self.mp_hands.HandLandmark.INDEX_FINGER_PIP, self.mp_hands.HandLandmark.INDEX_FINGER_DIP, self.mp_hands.HandLandmark.INDEX_FINGER_TIP]),
+                ("MIDDLE", [self.mp_hands.HandLandmark.MIDDLE_FINGER_MCP, self.mp_hands.HandLandmark.MIDDLE_FINGER_PIP, self.mp_hands.HandLandmark.MIDDLE_FINGER_DIP, self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP]),
+                ("RING", [self.mp_hands.HandLandmark.RING_FINGER_MCP, self.mp_hands.HandLandmark.RING_FINGER_PIP, self.mp_hands.HandLandmark.RING_FINGER_DIP, self.mp_hands.HandLandmark.RING_FINGER_TIP]),
+                ("PINKY", [self.mp_hands.HandLandmark.PINKY_MCP, self.mp_hands.HandLandmark.PINKY_PIP, self.mp_hands.HandLandmark.PINKY_DIP, self.mp_hands.HandLandmark.PINKY_TIP])
+            ]
+            for name, indices in finger_definitions:
+                mcp, pip, dip, tip = [hand_landmarks[i] for i in indices]
+                angle1 = self.calculate_angle_3d(h_wrist_lm, mcp, pip)
+                angle2 = self.calculate_angle_3d(mcp, pip, dip)
+                angle3 = self.calculate_angle_3d(pip, dip, tip)
+                avg_angle = (angle1 + angle2 + angle3) / 3.0
+                fingers_flexion.append(avg_angle)
+            state_msg.fingers_flexion = fingers_flexion
+
+            hand_thumb_cmc = hand_landmarks[self.mp_hands.HandLandmark.THUMB_CMC]
+            hand_thumb_mcp = hand_landmarks[self.mp_hands.HandLandmark.THUMB_MCP]
+            hand_thumb_ip = hand_landmarks[self.mp_hands.HandLandmark.THUMB_IP]
+            state_msg.thumb_flexion = self.calculate_angle_3d(hand_thumb_cmc, hand_thumb_mcp, hand_thumb_ip)
+            state_msg.thumb_abduction = self.calculate_angle_3d(h_index_mcp, hand_thumb_cmc, hand_thumb_mcp)
+
+            self.state_publisher.publish(state_msg)
+
+        # --- 시각화 부분 ---
+        target_color = (0, 255, 0) if is_elbow_in_target else (0, 0, 255)
+        cv2.circle(image, self.elbow_target_center_px, self.elbow_target_radius_px, target_color, 2)
+        cv2.putText(image, ' ', (self.elbow_target_center_px[0] - 70, self.elbow_target_center_px[1] - 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, target_color, 2)
+
+        if pose_results.pose_landmarks: self.mp_drawing.draw_landmarks(image, pose_results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
+        if hand_results.multi_hand_landmarks:
+             for hand_lm in hand_results.multi_hand_landmarks: self.mp_drawing.draw_landmarks(image, hand_lm, self.mp_hands.HAND_CONNECTIONS)
+
+        cv2.imshow('Fixed Elbow Tracking', cv2.flip(image, 1))
+        cv2.waitKey(5)
+
+    def destroy_node(self):
+        self.get_logger().info('노드를 종료합니다.')
+        self.cap.release()
+        cv2.destroyAllWindows()
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    arm_pose_publisher = ArmPosePublisher()
+    try:
+        rclpy.spin(arm_pose_publisher)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        arm_pose_publisher.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
