@@ -1,0 +1,131 @@
+import rclpy
+from rclpy.node import Node
+import cv2
+import mediapipe as mp
+import numpy as np
+
+# TODO: 'arm_pose_msgs'를 실제 패키지 이름으로 변경하세요.
+# 새로 정의한 ArmHandLandmarks 메시지와 Point 메시지를 임포트합니다.
+from arm_pose_msgs.msg import ArmHandLandmarks 
+from geometry_msgs.msg import Point
+
+class ArmPosePublisher(Node):
+    def __init__(self):
+        super().__init__('arm_pose_publisher')
+        
+        # 퍼블리셔를 새로운 메시지 타입과 토픽 이름으로 변경합니다.
+        self.landmark_publisher = self.create_publisher(ArmHandLandmarks, 'arm_hand_landmarks', 10)
+        
+        timer_period = 0.06
+        self.timer = self.create_timer(timer_period, self.timer_callback)
+        
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            self.get_logger().error('웹캠을 열 수 없습니다.')
+            return
+
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7, max_num_hands=1)
+        self.mp_drawing = mp.solutions.drawing_utils
+
+        self.get_logger().info('Arm Pose Landmark Publisher 노드가 시작되었습니다.')
+
+    def assign_landmark(self, point_msg, landmark):
+        """MediaPipe 랜드마크의 x, y, z 좌표를 geometry_msgs/Point에 할당하는 헬퍼 함수"""
+        point_msg.x = landmark.x
+        point_msg.y = landmark.y
+        point_msg.z = landmark.z
+
+    def timer_callback(self):
+        success, image = self.cap.read()
+        if not success:
+            return
+
+        image.flags.writeable = False
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        pose_results = self.pose.process(image_rgb)
+        hand_results = self.hands.process(image_rgb)
+        
+        image.flags.writeable = True
+        
+        # 팔과 손이 모두 감지되었을 때만 메시지를 발행합니다.
+        if pose_results.pose_landmarks and hand_results.multi_hand_landmarks:
+            pose_landmarks = pose_results.pose_landmarks.landmark
+            hand_landmarks = hand_results.multi_hand_landmarks[0].landmark
+
+            # 발행할 메시지 객체를 생성합니다.
+            landmarks_msg = ArmHandLandmarks()
+            landmarks_msg.header.stamp = self.get_clock().now().to_msg()
+
+            # --- 1. 팔 랜드마크 좌표 할당 (왼팔 기준) ---
+            self.assign_landmark(landmarks_msg.left_shoulder, pose_landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER])
+            self.assign_landmark(landmarks_msg.left_elbow, pose_landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW])
+            self.assign_landmark(landmarks_msg.pose_left_wrist, pose_landmarks[self.mp_pose.PoseLandmark.LEFT_WRIST])
+            self.assign_landmark(landmarks_msg.hand_left_wrist, hand_landmarks[0])
+          
+            # --- 2. 손가락 랜드마크 좌표 할당 ---
+            # 엄지 (Thumb)
+            self.assign_landmark(landmarks_msg.thumb_cmc, hand_landmarks[self.mp_hands.HandLandmark.THUMB_CMC])
+            self.assign_landmark(landmarks_msg.thumb_mcp, hand_landmarks[self.mp_hands.HandLandmark.THUMB_MCP])
+            self.assign_landmark(landmarks_msg.thumb_ip, hand_landmarks[self.mp_hands.HandLandmark.THUMB_IP])
+            self.assign_landmark(landmarks_msg.thumb_tip, hand_landmarks[self.mp_hands.HandLandmark.THUMB_TIP])
+
+            # 검지 (Index Finger)
+            self.assign_landmark(landmarks_msg.index_mcp, hand_landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_MCP])
+            self.assign_landmark(landmarks_msg.index_pip, hand_landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_PIP])
+            self.assign_landmark(landmarks_msg.index_dip, hand_landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_DIP])
+            self.assign_landmark(landmarks_msg.index_tip, hand_landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_TIP])
+
+            # 중지 (Middle Finger)
+            self.assign_landmark(landmarks_msg.middle_mcp, hand_landmarks[self.mp_hands.HandLandmark.MIDDLE_FINGER_MCP])
+            self.assign_landmark(landmarks_msg.middle_pip, hand_landmarks[self.mp_hands.HandLandmark.MIDDLE_FINGER_PIP])
+            self.assign_landmark(landmarks_msg.middle_dip, hand_landmarks[self.mp_hands.HandLandmark.MIDDLE_FINGER_DIP])
+            self.assign_landmark(landmarks_msg.middle_tip, hand_landmarks[self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP])
+
+            # 약지 (Ring Finger)
+            self.assign_landmark(landmarks_msg.ring_mcp, hand_landmarks[self.mp_hands.HandLandmark.RING_FINGER_MCP])
+            self.assign_landmark(landmarks_msg.ring_pip, hand_landmarks[self.mp_hands.HandLandmark.RING_FINGER_PIP])
+            self.assign_landmark(landmarks_msg.ring_dip, hand_landmarks[self.mp_hands.HandLandmark.RING_FINGER_DIP])
+            self.assign_landmark(landmarks_msg.ring_tip, hand_landmarks[self.mp_hands.HandLandmark.RING_FINGER_TIP])
+
+            # 새끼 (Pinky Finger)
+            self.assign_landmark(landmarks_msg.pinky_mcp, hand_landmarks[self.mp_hands.HandLandmark.PINKY_MCP])
+            self.assign_landmark(landmarks_msg.pinky_pip, hand_landmarks[self.mp_hands.HandLandmark.PINKY_PIP])
+            self.assign_landmark(landmarks_msg.pinky_dip, hand_landmarks[self.mp_hands.HandLandmark.PINKY_DIP])
+            self.assign_landmark(landmarks_msg.pinky_tip, hand_landmarks[self.mp_hands.HandLandmark.PINKY_TIP])
+
+            # 채워진 메시지를 발행합니다.
+            self.landmark_publisher.publish(landmarks_msg)
+
+        # 시각화 부분 (기존과 동일)
+        if pose_results.pose_landmarks:
+            self.mp_drawing.draw_landmarks(image, pose_results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
+        if hand_results.multi_hand_landmarks:
+            for hand_lm in hand_results.multi_hand_landmarks:
+                self.mp_drawing.draw_landmarks(image, hand_lm, self.mp_hands.HAND_CONNECTIONS)
+
+        cv2.imshow('Arm and Hand Tracking', cv2.flip(image, 1))
+        cv2.waitKey(5)
+
+    def destroy_node(self):
+        self.get_logger().info('노드를 종료합니다.')
+        self.cap.release()
+        cv2.destroyAllWindows()
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    arm_pose_publisher = ArmPosePublisher()
+    try:
+        rclpy.spin(arm_pose_publisher)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        arm_pose_publisher.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
